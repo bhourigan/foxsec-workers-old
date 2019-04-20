@@ -5,22 +5,23 @@ import functools
 import time
 import json
 import pprint
+import ipaddress
 import boto3
 from botocore.exceptions import ClientError
 
 # Config
 #region = os.environ.get('AWS_DEFAULT_REGION', 'us-east-1')
 WAF_IPSET_ID = os.environ.get('IPSET_ID')
+WAF_IPSET_EXPIRATION_HOURS = os.environ.get('IPSET_EXPIRATION_HOURS', 24)
 
 # Constants
 DYNAMODB = boto3.resource('dynamodb').Table('foxsec-waf')
 SQS = boto3.client('sqs')
 WAFREGIONAL = boto3.client('waf-regional')
+PRETTYPRINT = pprint.PrettyPrinter(indent=4)
 
 def parse_arn(arn):
-    """Parse ARN string
-    http://docs.aws.amazon.com/general/latest/gr/aws-arns-and-namespaces.html
-    """
+    """Parse ARN"""
 
     elements = arn.split(':', 5)
     result = {
@@ -65,100 +66,150 @@ def retry(retry_count=5, delay=5, allowed_exceptions=()):
 @retry(retry_count=5, delay=5)
 def waf_update_ip_set(waf_ipset_id, waf_updates):
     """Update WAF ip set"""
-    pretty_print = pprint.PrettyPrinter(indent=8)
-
     # Get our change token
     try:
         change_token = WAFREGIONAL.get_change_token() #print(token['ChangeToken'])
-    except ClientError as current_exception:
-        print("waf get_change_token failed: %s" % current_exception)
+    except ClientError as err:
+        print("waf get_change_token failed: %s" % err)
         return False
 
     # ChangeTokenStatus, ResponseMetadata.RetryAttempts
     try:
         token_status = WAFREGIONAL.get_change_token_status(ChangeToken=change_token['ChangeToken'])
-        print("Token %s status" % change_token['ChangeToken'])
-        pretty_print.pprint(token_status)
-    except ClientError as current_exception:
-        print("waf get_change_token_status failed: %s" % current_exception)
+        print("TOKEN %s" % change_token['ChangeToken'])
+        PRETTYPRINT.pprint(token_status)
+    except ClientError as err:
+        print("waf get_change_token_status failed: %s" % err)
         return False
 
-    # Update our WAF ipset
+    # Update our WAF ipset and return if successful
     try:
         WAFREGIONAL.update_ip_set(IPSetId=waf_ipset_id,
                                   ChangeToken=change_token['ChangeToken'],
                                   Updates=waf_updates)
-    except ClientError as current_exception:
-        print("waf update_ip_set failed: %s" % current_exception)
+    except ClientError as err:
+        print("waf update_ip_set failed: %s" % err)
+        return False
+    else:
+        return True
+
+def sqs_delete_messages(arn, messages):
+    """Delete messages from SQS arn"""
+    # Parse SQS ARN
+    arn = parse_arn(arn)
+
+    # Get queue url from queue name
+    try:
+        queue_url = SQS.get_queue_url(QueueName=arn.get('resource'))
+    except ClientError as err:
+        print("sqs get_queue_url failed: %s" % err)
         return False
 
-    return True
+    # Delete received messages and return if successful
+    try:
+        SQS.delete_message_batch(QueueUrl=queue_url.get('QueueUrl'), Entries=messages)
+    except ClientError as err:
+        print("sqs delete_message_batch failed: %s" % err)
+        return False
+    else:
+        return True
+
+def ip_address_validate(address):
+    """Confirm valid IP and identify v4/v6"""
+    ip_types = {4:'IPV4', 6:'IPV6'}
+
+    try:
+        ip_network = ipaddress.ip_network(address)
+    except ValueError as err:
+        print("ip_network failed: %s" % err)
+        return err
+    else:
+        return str(ip_network), ip_types[ip_network.version]
+
+def dynamodb_put_items(items):
+    """Put items in DynamoDB. One item at a time."""
+    for item in items:
+        try:
+            DYNAMODB.put_item(Item=item)
+        except ClientError as err:
+            print("dybamodb put item failed: %s" % err)
 
 def lambda_handler(event, context):
     """Main entrypoint handler"""
-    pretty_print = pprint.PrettyPrinter(indent=4)
-
+    # Initialize
+    del context # Unused
     waf_updates = []
     sqs_entries = []
+    dynamodb_items = []
 
+    # Evaluate each record
     record = None
     for record in event.get('Records'):
-        # Parse Records[].body
-        body = json.loads(record.get('body'))
-        # Parse body['metadata']
-        metadata = {item['key']:item['value'] for item in body['metadata']}
-        # Parse metadata window_timestamp
-        window_timestamp = datetime.datetime.strptime(metadata['window_timestamp'],
-                                                      "%Y-%m-%dT%H:%M:%S.%fZ")
-
-        # DEBUG: Pretty print body
-        print("Body")
-        pretty_print.pprint(body)
-
-        # Put item in DynamoDB
-        try:
-            expires_at = str(window_timestamp + datetime.timedelta(days=1))
-            DYNAMODB.put_item(Item={'id': body['id'],
-                                    'summary': body['summary'],
-                                    'address': metadata['sourceaddress'],
-                                    'blocked_at': datetime.datetime.now(),
-                                    'expires_at': expires_at})
-
-        except ClientError as current_exception:
-            print("dybamodb put item failed: %s" % current_exception)
-
-        # TODO: Validate sourceaddress
-
-        # Put item in waf_updates list
-        waf_update = {'Action': 'INSERT',
-                      'IPSetDescriptor': {'Type': 'IPV4',
-                                          'Value': metadata['sourceaddress']+"/32"}}
-        waf_updates.append(waf_update)
-
-        # Put item in sqs_entries list
+        # Mark SQS message for deletion early
         sqs_entry = {'Id': record.get('messageId'), 'ReceiptHandle': record.get('receiptHandle')}
         sqs_entries.append(sqs_entry)
 
-    # DEBUG: Print waf_updates
-    print("WAF Updates")
-    pretty_print.pprint(waf_updates)
+        # Skip invalid records
+        if not record.get('body'):
+            print("Missing body")
+            continue
 
-    # Update WAF ip set
-    waf_update_ip_set(WAF_IPSET_ID, waf_updates)
+        # Load JSON
+        body = json.loads(record.get('body'))
 
-    # Get our queue url from the arn provided to us through the trigger
-    arn = parse_arn(record.get('eventSourceARN'))
+        # Skip records without metadata
+        if not body.get('metadata'):
+            print("Missing metadata")
+            continue
 
-    # Get queue url
-    try:
-        queue_url = SQS.get_queue_url(QueueName=arn.get('resource'))
-    except ClientError as current_exception:
-        print("sqs get_queue_url failed: %s" % current_exception)
+        # List of dict to dict
+        metadata = {item['key']:item['value'] for item in body['metadata']}
 
-    # Delete received messages
-    try:
-        SQS.delete_message_batch(QueueUrl=queue_url.get('QueueUrl'), Entries=sqs_entries)
-    except ClientError as current_exception:
-        print("sqs delete_message_batch failed: %s" % current_exception)
+        # Parse window_timestamp to datetime, calculate expires_at
+        window_timestamp = datetime.datetime.strptime(metadata['window_timestamp'],
+                                                      "%Y-%m-%dT%H:%M:%S.%fZ")
+        expires_at = window_timestamp + datetime.timedelta(hours=int(WAF_IPSET_EXPIRATION_HOURS))
 
-    print("END OF EXECUTION")
+        # Validate sourceaddress
+        try:
+            source_address, source_type = ip_address_validate(metadata['sourceaddress'])
+        except: # pylint: disable-msg=W0702
+            print("Invalid sourceaddress, continuing")
+            continue
+
+        # Sanity check
+        if expires_at < datetime.datetime.now():
+            print("Expire date in the past, continuing")
+            continue
+
+        # Put item in dynamodb put list
+        dynamodb_item = {'id': body['id'],
+                         'summary': body['summary'],
+                         'address': source_address,
+                         'blocked_at': str(datetime.datetime.now()),
+                         'expires_at': str(expires_at)}
+        dynamodb_items.append(dynamodb_item)
+
+        # Add update to waf updates
+        waf_update = {'Action': 'INSERT',
+                      'IPSetDescriptor': {'Type': source_type,
+                                          'Value': source_address}}
+        waf_updates.append(waf_update)
+
+    # Delete SQS messages
+    if sqs_entries:
+        print("SQS")
+        PRETTYPRINT.pprint(sqs_entries)
+        sqs_delete_messages(record.get('eventSourceARN'), sqs_entries)
+
+    # Put items in DynamoDB
+    if dynamodb_items:
+        print("DYNAMODB")
+        PRETTYPRINT.pprint(dynamodb_items)
+        dynamodb_put_items(items=dynamodb_items)
+
+    # Update WAF ip sets
+    if waf_updates:
+        print("WAF")
+        PRETTYPRINT.pprint(waf_updates)
+        waf_update_ip_set(WAF_IPSET_ID, waf_updates)
