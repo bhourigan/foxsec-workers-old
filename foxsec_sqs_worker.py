@@ -4,8 +4,8 @@ import datetime
 import functools
 import time
 import json
-import pprint
 import ipaddress
+from pprint import pprint
 import boto3
 from botocore.exceptions import ClientError
 
@@ -18,7 +18,6 @@ WAF_IPSET_EXPIRATION_HOURS = os.environ.get('IPSET_EXPIRATION_HOURS', 24)
 DYNAMODB = boto3.resource('dynamodb').Table('foxsec-waf')
 SQS = boto3.client('sqs')
 WAFREGIONAL = boto3.client('waf-regional')
-PRETTYPRINT = pprint.PrettyPrinter(indent=4)
 
 def parse_arn(arn):
     """Parse ARN"""
@@ -54,7 +53,7 @@ def retry(retry_count=5, delay=5, allowed_exceptions=()):
                 except allowed_exceptions as current_exception:
                     last_exception = current_exception
                 print("%s: Waiting for %s seconds before retrying again"
-                      % (datetime.datetime.now(), delay))
+                      % (datetime.datetime.utcnow(), delay))
                 time.sleep(delay)
 
             if last_exception is not None:
@@ -77,7 +76,7 @@ def waf_update_ip_set(waf_ipset_id, waf_updates):
     try:
         token_status = WAFREGIONAL.get_change_token_status(ChangeToken=change_token['ChangeToken'])
         print("TOKEN %s" % change_token['ChangeToken'])
-        PRETTYPRINT.pprint(token_status)
+        pprint(token_status)
     except ClientError as err:
         print("waf get_change_token_status failed: %s" % err)
         return False
@@ -178,7 +177,7 @@ def lambda_handler(event, context):
             continue
 
         # Sanity check
-        if expires_at < datetime.datetime.now():
+        if expires_at < datetime.datetime.utcnow():
             print("Expire date in the past, continuing")
             continue
 
@@ -186,7 +185,7 @@ def lambda_handler(event, context):
         dynamodb_item = {'id': body['id'],
                          'summary': body['summary'],
                          'address': source_address,
-                         'blocked_at': str(datetime.datetime.now()),
+                         'blocked_at': str(datetime.datetime.utcnow()),
                          'expires_at': str(expires_at)}
         dynamodb_items.append(dynamodb_item)
 
@@ -199,17 +198,17 @@ def lambda_handler(event, context):
     # Delete SQS messages
     if sqs_entries:
         print("SQS")
-        PRETTYPRINT.pprint(sqs_entries)
+        pprint(sqs_entries)
         sqs_delete_messages(record.get('eventSourceARN'), sqs_entries)
 
     # Put items in DynamoDB
     if dynamodb_items:
         print("DYNAMODB")
-        PRETTYPRINT.pprint(dynamodb_items)
+        pprint(dynamodb_items)
         dynamodb_put_items(items=dynamodb_items)
 
     # Update WAF ip sets
     if waf_updates:
         print("WAF")
-        PRETTYPRINT.pprint(waf_updates)
+        pprint(waf_updates)
         waf_update_ip_set(WAF_IPSET_ID, waf_updates)
