@@ -5,12 +5,14 @@ import functools
 import time
 import ipaddress
 from pprint import pprint
+import requests
 import boto3
 from botocore.exceptions import ClientError
 
 # Config
 #region = os.environ.get('AWS_DEFAULT_REGION', 'us-east-1')
 WAF_IPSET_ID = os.environ.get('IPSET_ID')
+SLACK_WEBHOOK_URL = os.environ.get('SLACK_WEBHOOK_URL')
 
 # Constants
 DYNAMODB = boto3.resource('dynamodb').Table('foxsec-waf')
@@ -21,6 +23,8 @@ def retry(retry_count=5, delay=5, allowed_exceptions=()):
     def decorator(func):
         @functools.wraps(func)
         def wrapper(*args, **kwargs):
+            last_exception = None
+
             for _ in range(retry_count):
                 try:
                     result = func(*args, **kwargs)
@@ -57,12 +61,15 @@ def waf_mark_ipset_delete(source_address, source_type, waf_updates):
     waf_update = {'Action': 'DELETE',
                   'IPSetDescriptor': {'Type': source_type,
                                       'Value': source_address}}
-    waf_updates.append(waf_update)
+
+    if not waf_update in waf_updates:
+        waf_updates.append(waf_update)
 
 @retry(retry_count=5, delay=5)
 def waf_update_ip_set(waf_ipset_id, waf_updates):
     """Update WAF ip set"""
     # Get our change token
+
     try:
         change_token = WAFREGIONAL.get_change_token() #print(token['ChangeToken'])
     except ClientError as err:
@@ -93,11 +100,79 @@ def dynamodb_delete_items(items):
     """
     Remove item ids from dynamodb
     """
+
     for item in items:
         try:
             DYNAMODB.delete_item(Key={'id': item})
         except ClientError as err:
             print("dynamodb delete_item failed: %s" % err)
+
+def slack_log_expiration(source_address, expires_at, slack_messages):
+    """
+    Post a message to Slack when a WAF entry expires
+    """
+
+    slack_data = {
+        "attachments": [{
+            "fallback": "WAF Blacklist entry removed for {}".format(source_address),
+            "color": "#36a64f",
+            "pretext": "WAF Blacklist entry removed",
+            "fields": [{
+                "title": "Address",
+                "value": source_address,
+                "short": False
+            }, {
+                "title": "Expired",
+                "value": expires_at,
+                "short": False
+            }],
+            "footer": "Foxsec dynamo worker"
+        }]
+    }
+
+    # Queue message
+    slack_messages.append(slack_data)
+
+def slack_log_untracked(source_address, slack_messages):
+    """
+    Post a message to Slack when a WAF entry is not tracked in Dynamo
+    """
+
+    slack_data = {
+        "attachments": [{
+            "fallback": "Untracked WAF blacklist entry {} removed".format(source_address),
+            "color": "#ff004f",
+            "pretext": "Untracked WAF blacklist entry removed",
+            "fields": [{
+                "title": "Address",
+                "value": source_address,
+                "short": False
+            }],
+            "footer": "Foxsec dynamo worker"
+        }]
+    }
+
+    # Queue message
+    slack_messages.append(slack_data)
+
+def post_slack_messages(slack_messages):
+    """
+    Post a message to Slack
+    """
+
+    for slack_data in slack_messages:
+        # Post the message to webhook
+        response = requests.post(SLACK_WEBHOOK_URL, json=slack_data,
+                                 headers={'Content-Type': 'application/json'})
+
+        # Slack docs say 1 message/s
+        time.sleep(1)
+
+        if response.status_code != 200:
+            raise ValueError(
+                'Request to slack returned an error %s, the response is:\n%s'
+                % (response.status_code, response.text)
+            )
 
 def main():
     """Main"""
@@ -106,6 +181,7 @@ def main():
     waf_rogue_addresses = 0
     dynamodb_pending_delete = []
     dynamodb_expired_addresses = 0
+    slack_messages = []
 
     # Get current time
     current_time = datetime.datetime.utcnow()
@@ -120,13 +196,23 @@ def main():
 
     # Iteriate through DynamoDB
     for item in dynamodb_items.get('Items'):
+        # Limit how many rules we evaluate per run
+        if dynamodb_expired_addresses >= 75:
+            break
+
         source_address, source_type = ip_address_validate(item.get('address'))
         expires_at = datetime.datetime.strptime(item.get('expires_at'),
                                                 "%Y-%m-%d %H:%M:%S.%f")
         if expires_at < current_time:
             if source_address in ip_networks:
+                # Console log
                 print('[Dynamo] Marking address %s for removal (expired %s)'
                       % (source_address, expires_at))
+
+                # Slack log
+                slack_log_expiration(source_address=source_address,
+                                     expires_at=expires_at.strftime("%Y-%m-%d %H:%M:%S"),
+                                     slack_messages=slack_messages)
 
                 # Mark for deletion in DynamoDB
                 dynamodb_pending_delete.append(item.get('id'))
@@ -139,10 +225,19 @@ def main():
     # Iteriate through WAF ipset
     items = dynamodb_items.get('Items')
     for ip in ip_networks: # pylint: disable-msg=C0103
+        # Limit how many WAF entries we evaluate per run
+        if waf_rogue_addresses >= 75:
+            break
+
         source_address, source_type = ip_address_validate(ip)
 
         if not list(filter(lambda item: item.get('address') == source_address, items)):
+            # Console log
             print('[waf] Rogue ipset address %s marked for removal' % source_address)
+
+            # Slack log
+            slack_log_untracked(source_address=source_address,
+                                slack_messages=slack_messages)
 
             # Mark for removal from waf ipset
             waf_mark_ipset_delete(source_address, source_type, waf_updates)
@@ -154,7 +249,12 @@ def main():
 
     # Execute WAF updates
     if waf_updates:
-        waf_update_ip_set(WAF_IPSET_ID, waf_updates)
+        if not waf_update_ip_set(WAF_IPSET_ID, waf_updates):
+            print("waf_update_ip_set failed")
+            return False
+
+    # Post to Slack
+    post_slack_messages(slack_messages)
 
     print("Removed %d expired ipset entries, and %d rogue WAF entries"
           % (dynamodb_expired_addresses, waf_rogue_addresses))
