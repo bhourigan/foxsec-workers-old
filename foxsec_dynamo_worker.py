@@ -34,6 +34,7 @@ def retry(retry_count=5, delay=5, allowed_exceptions=()):
                         return result
                 except allowed_exceptions as current_exception:
                     last_exception = current_exception
+                # Instead of printing, consider using python logging module
                 print("%s: Waiting for %s seconds before retrying again"
                       % (datetime.datetime.utcnow(), delay))
                 time.sleep(delay)
@@ -62,9 +63,14 @@ def waf_mark_ipset_delete(source_address, source_type, waf_updates):
     """
     Mark an address for deletion in waf_updates
     """
-    waf_update = {'Action': 'DELETE',
-                  'IPSetDescriptor': {'Type': source_type,
-                                      'Value': source_address}}
+    waf_update = {
+        'Action': 'DELETE',
+        'IPSetDescriptor':
+        {
+            'Type': source_type,
+            'Value': source_address
+        }
+    }
 
     if waf_update not in waf_updates:
         waf_updates.append(waf_update)

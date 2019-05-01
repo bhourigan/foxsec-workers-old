@@ -54,6 +54,7 @@ def retry(retry_count=5, delay=5, allowed_exceptions=()):
                         return result
                 except allowed_exceptions as current_exception:
                     last_exception = current_exception
+                # Instead of printing, consider using python logging module
                 print("%s: Waiting for %s seconds before retrying again"
                       % (datetime.datetime.utcnow(), delay))
                 time.sleep(delay)
