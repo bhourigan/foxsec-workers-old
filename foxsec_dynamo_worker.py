@@ -4,20 +4,21 @@ import datetime
 import functools
 import time
 import ipaddress
-from pprint import pprint
 import requests
 import boto3
 from botocore.exceptions import ClientError
+from pprint import pprint
 
 # Config
-#region = os.environ.get('AWS_DEFAULT_REGION', 'us-east-1')
+# region = os.environ.get('AWS_DEFAULT_REGION', 'us-east-1')
 WAF_IPSET_ID = os.environ.get('IPSET_ID')
-#TODO: Store in secrets manager
+# TODO: Store in secrets manager
 SLACK_WEBHOOK_URL = os.environ.get('SLACK_WEBHOOK_URL')
 
 # Constants
 DYNAMODB = boto3.resource('dynamodb').Table('foxsec-waf')
 WAFREGIONAL = boto3.client('waf-regional')
+
 
 def retry(retry_count=5, delay=5, allowed_exceptions=()):
     """Decorator that allows function retries"""
@@ -43,9 +44,10 @@ def retry(retry_count=5, delay=5, allowed_exceptions=()):
         return wrapper
     return decorator
 
+
 def ip_address_validate(address):
     """Confirm valid IP and identify v4/v6"""
-    ip_types = {4:'IPV4', 6:'IPV6'}
+    ip_types = {4: 'IPV4', 6: 'IPV6'}
 
     try:
         ip_network = ipaddress.ip_network(address)
@@ -55,6 +57,7 @@ def ip_address_validate(address):
     else:
         return str(ip_network), ip_types[ip_network.version]
 
+
 def waf_mark_ipset_delete(source_address, source_type, waf_updates):
     """
     Mark an address for deletion in waf_updates
@@ -63,8 +66,9 @@ def waf_mark_ipset_delete(source_address, source_type, waf_updates):
                   'IPSetDescriptor': {'Type': source_type,
                                       'Value': source_address}}
 
-    if not waf_update in waf_updates:
+    if waf_update not in waf_updates:
         waf_updates.append(waf_update)
+
 
 @retry(retry_count=5, delay=5)
 def waf_update_ip_set(waf_ipset_id, waf_updates):
@@ -72,7 +76,7 @@ def waf_update_ip_set(waf_ipset_id, waf_updates):
     # Get our change token
 
     try:
-        change_token = WAFREGIONAL.get_change_token() #print(token['ChangeToken'])
+        change_token = WAFREGIONAL.get_change_token()  # print(token['ChangeToken'])
     except ClientError as err:
         print("waf get_change_token failed: %s" % err)
         return False
@@ -97,6 +101,7 @@ def waf_update_ip_set(waf_ipset_id, waf_updates):
     else:
         return True
 
+
 def dynamodb_delete_items(items):
     """
     Remove item ids from dynamodb
@@ -108,6 +113,7 @@ def dynamodb_delete_items(items):
             DYNAMODB.delete_item(Key={'id': item})
         except ClientError as err:
             print("dynamodb delete_item failed: %s" % err)
+
 
 def slack_log_expiration(source_address, expires_at, blocked_at, summary, slack_messages):
     """
@@ -142,6 +148,7 @@ def slack_log_expiration(source_address, expires_at, blocked_at, summary, slack_
     # Queue message
     slack_messages.append(slack_data)
 
+
 def slack_log_untracked(source_address, slack_messages):
     """
     Post a message to Slack when a WAF entry is not tracked in Dynamo
@@ -164,6 +171,7 @@ def slack_log_untracked(source_address, slack_messages):
     # Queue message
     slack_messages.append(slack_data)
 
+
 def post_slack_messages(slack_messages):
     """
     Post a message to Slack
@@ -183,6 +191,7 @@ def post_slack_messages(slack_messages):
                 % (response.status_code, response.text)
             )
 
+
 def main():
     """Main"""
     # Init
@@ -197,8 +206,9 @@ def main():
     current_time = datetime.datetime.utcnow()
 
     # Get Dynamo items
-    dynamodb_items = DYNAMODB.scan(ProjectionExpression=
-                                   'id, address, expires_at, blocked_at, summary')
+    dynamodb_items = DYNAMODB.scan(
+        ProjectionExpression='id, address, expires_at, blocked_at, summary'
+        )
 
     # Get ipset contents
     waf_ip_set = WAFREGIONAL.get_ip_set(IPSetId=WAF_IPSET_ID)
@@ -244,10 +254,9 @@ def main():
                 # Mark for removal from waf ipset
                 waf_mark_ipset_delete(source_address, source_type, waf_updates)
 
-
     # Iteriate through WAF ipset
     items = dynamodb_items.get('Items')
-    for ip in ip_networks: # pylint: disable-msg=C0103
+    for ip in ip_networks:  # pylint: disable-msg=C0103
         # Limit how many Slack-notified rules we evaluate per run
         if slack_notifications >= 150:
             break
@@ -286,6 +295,7 @@ def main():
     print("Removed %d expired ipset entries, %d rogue WAF entries, and sent %d slack notifications"
           % (dynamodb_expired_addresses, waf_rogue_addresses, slack_notifications))
     return True
+
 
 if __name__ == "__main__":
     main()
