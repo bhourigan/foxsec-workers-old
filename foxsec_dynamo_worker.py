@@ -4,13 +4,13 @@ import datetime
 import functools
 import time
 import ipaddress
+import re
 import requests
 import boto3
 from botocore.exceptions import ClientError
 from pprint import pprint
 
 # Config
-# region = os.environ.get('AWS_DEFAULT_REGION', 'us-east-1')
 WAF_IPSET_ID = os.environ.get('IPSET_ID')
 # TODO: Store in secrets manager
 SLACK_WEBHOOK_URL = os.environ.get('SLACK_WEBHOOK_URL')
@@ -126,6 +126,8 @@ def slack_log_expiration(source_address, expires_at, blocked_at, summary, slack_
     Post a message to Slack when a WAF entry expires
     """
 
+    search_pattern = source_address.split('/')[0]
+    escaped_search_pattern = re.escape(search_pattern)
     slack_data = {
         "attachments": [{
             "fallback": "WAF Blacklist entry removed for {}".format(source_address),
@@ -147,7 +149,12 @@ def slack_log_expiration(source_address, expires_at, blocked_at, summary, slack_
                 "title": "Summary",
                 "value": summary
             }],
-            "footer": "Foxsec dynamo worker"
+            "actions": [{
+                "type": "button",
+                "text": "View logs",
+                "url": "https://console.aws.amazon.com/cloudwatch/home?region=us-east-1#logs-insights:queryDetail=~(end~0~start~-3600~timeType~'RELATIVE~unit~'seconds~editorString~'fields*20*40message*20*7c*20filter*20*40message*20like*20*2f{}*2f*0a*7c*20sort*20*40timestamp*20desc*0a*7c*20limit*202000~isLiveTail~false~queryId~'webserver-prod*2fapache_access~source~'webserver-prod*2fapache_access)".format(escaped_search_pattern)
+            }],
+            "footer": "foxsec_dynamo_worker"
         }]
     }
 
