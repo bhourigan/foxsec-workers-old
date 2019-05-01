@@ -12,6 +12,7 @@ from botocore.exceptions import ClientError
 # Config
 #region = os.environ.get('AWS_DEFAULT_REGION', 'us-east-1')
 WAF_IPSET_ID = os.environ.get('IPSET_ID')
+#TODO: Store in secrets manager
 SLACK_WEBHOOK_URL = os.environ.get('SLACK_WEBHOOK_URL')
 
 # Constants
