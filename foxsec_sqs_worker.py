@@ -178,7 +178,7 @@ def lambda_handler(event, context):
 
         # Sanity check
         if expires_at < datetime.datetime.utcnow():
-            print("Expire date in the past, continuing")
+            print("Expire date in the past, skipping %s" % (body['id']))
             continue
 
         # Put item in dynamodb put list

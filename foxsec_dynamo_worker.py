@@ -101,13 +101,14 @@ def dynamodb_delete_items(items):
     Remove item ids from dynamodb
     """
 
+    print("Removing %d items from DynamoDB" % (len(items)))
     for item in items:
         try:
             DYNAMODB.delete_item(Key={'id': item})
         except ClientError as err:
             print("dynamodb delete_item failed: %s" % err)
 
-def slack_log_expiration(source_address, expires_at, slack_messages):
+def slack_log_expiration(source_address, expires_at, blocked_at, summary, slack_messages):
     """
     Post a message to Slack when a WAF entry expires
     """
@@ -120,11 +121,18 @@ def slack_log_expiration(source_address, expires_at, slack_messages):
             "fields": [{
                 "title": "Address",
                 "value": source_address,
-                "short": False
+                "short": True,
+            }, {
+                "title": "Blocked",
+                "value": blocked_at,
+                "short": True
             }, {
                 "title": "Expired",
                 "value": expires_at,
-                "short": False
+                "short": True
+            }, {
+                "title": "Summary",
+                "value": summary
             }],
             "footer": "Foxsec dynamo worker"
         }]
@@ -181,13 +189,15 @@ def main():
     waf_rogue_addresses = 0
     dynamodb_pending_delete = []
     dynamodb_expired_addresses = 0
+    slack_notifications = 0
     slack_messages = []
 
     # Get current time
     current_time = datetime.datetime.utcnow()
 
     # Get Dynamo items
-    dynamodb_items = DYNAMODB.scan(ProjectionExpression='id, address, expires_at')
+    dynamodb_items = DYNAMODB.scan(ProjectionExpression=
+                                   'id, address, expires_at, blocked_at, summary')
 
     # Get ipset contents
     waf_ip_set = WAFREGIONAL.get_ip_set(IPSetId=WAF_IPSET_ID)
@@ -196,27 +206,39 @@ def main():
 
     # Iteriate through DynamoDB
     for item in dynamodb_items.get('Items'):
-        # Limit how many rules we evaluate per run
-        if dynamodb_expired_addresses >= 75:
-            break
-
         source_address, source_type = ip_address_validate(item.get('address'))
+        summary = item.get('summary')
         expires_at = datetime.datetime.strptime(item.get('expires_at'),
                                                 "%Y-%m-%d %H:%M:%S.%f")
-        if expires_at < current_time:
-            if source_address in ip_networks:
-                # Console log
-                print('[Dynamo] Marking address %s for removal (expired %s)'
-                      % (source_address, expires_at))
+        blocked_at = datetime.datetime.strptime(item.get('blocked_at'),
+                                                "%Y-%m-%d %H:%M:%S.%f")
 
+        if expires_at < current_time:
+            # Limit how many Slack-notified rules we evaluate per run
+            if slack_notifications >= 150:
+                break
+
+            # Limit how many DynamoDB items we need to delete per run
+            if dynamodb_expired_addresses >= 500:
+                break
+
+            # Console log
+            print('[Dynamo] Marking item %s, address %s for removal (expired %s)'
+                  % (item.get('id'), source_address, expires_at))
+
+            # Mark for deletion in DynamoDB
+            dynamodb_pending_delete.append(item.get('id'))
+            dynamodb_expired_addresses += 1
+
+            # Delete from WAF if present
+            if source_address in ip_networks:
                 # Slack log
+                slack_notifications += 1
                 slack_log_expiration(source_address=source_address,
                                      expires_at=expires_at.strftime("%Y-%m-%d %H:%M:%S"),
+                                     blocked_at=blocked_at.strftime("%Y-%m-%d %H:%M:%S"),
+                                     summary=summary,
                                      slack_messages=slack_messages)
-
-                # Mark for deletion in DynamoDB
-                dynamodb_pending_delete.append(item.get('id'))
-                dynamodb_expired_addresses += 1
 
                 # Mark for removal from waf ipset
                 waf_mark_ipset_delete(source_address, source_type, waf_updates)
@@ -225,17 +247,21 @@ def main():
     # Iteriate through WAF ipset
     items = dynamodb_items.get('Items')
     for ip in ip_networks: # pylint: disable-msg=C0103
-        # Limit how many WAF entries we evaluate per run
-        if waf_rogue_addresses >= 75:
+        # Limit how many Slack-notified rules we evaluate per run
+        if slack_notifications >= 150:
+            break
+
+        # Limit how many WAF updates per run
+        if waf_rogue_addresses >= 150:
             break
 
         source_address, source_type = ip_address_validate(ip)
-
         if not list(filter(lambda item: item.get('address') == source_address, items)):
             # Console log
             print('[waf] Rogue ipset address %s marked for removal' % source_address)
 
             # Slack log
+            slack_notifications += 1
             slack_log_untracked(source_address=source_address,
                                 slack_messages=slack_messages)
 
@@ -256,8 +282,9 @@ def main():
     # Post to Slack
     post_slack_messages(slack_messages)
 
-    print("Removed %d expired ipset entries, and %d rogue WAF entries"
-          % (dynamodb_expired_addresses, waf_rogue_addresses))
+    print("Removed %d expired ipset entries, %d rogue WAF entries, and sent %d slack notifications"
+          % (dynamodb_expired_addresses, waf_rogue_addresses, slack_notifications))
+    return True
 
 if __name__ == "__main__":
     main()
