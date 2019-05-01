@@ -65,5 +65,5 @@ entries that have expired.
 
 This worker also has the capability to post notifications to a Slack
 webhook. The primary audience for these messages is support staff,
-so sending to something like MozDef or another SEIM is likely not
+so sending to something like MozDef or another SIEM is likely not
 appropriate.
